@@ -56,6 +56,8 @@ type Command =
   | { type: "list"; vendorIds: number[] }
   | { type: "open"; device: string }
   | { type: "close"; device: string }
+  | { type: "listen"; device: string }
+  | { type: "unlisten"; device: string }
   | { type: "sendReport"; device: string; reportId: number; data: number[] }
   | { type: "sendFeatureReport"; device: string; reportId: number; data: number[] }
   | { type: "receiveFeatureReport"; device: string; reportId: number };
@@ -116,6 +118,7 @@ function vendorIdsFor(filters: HIDDeviceFilter[]): number[] {
 // TauriHidDevice, Bridge's native-hid) landed on the same shape.
 class BridgeHidDevice implements HIDDevice {
   readonly key: string;
+  readonly openMouseTransport = "bridge";
   readonly vendorId: number;
   readonly productId: number;
   readonly productName: string;
@@ -161,12 +164,17 @@ class BridgeHidDevice implements HIDDevice {
 
   addEventListener(type: "inputreport", listener: (event: HIDInputReportEvent) => void): void {
     if (type !== "inputreport") return;
+    const first = this.#listeners.size === 0;
     this.#listeners.add(listener);
+    if (first) void this.#client.request({ type: "listen", device: this.key }).catch(() => undefined);
   }
 
   removeEventListener(type: "inputreport", listener: (event: HIDInputReportEvent) => void): void {
     if (type !== "inputreport") return;
     this.#listeners.delete(listener);
+    if (this.#listeners.size === 0) {
+      void this.#client.request({ type: "unlisten", device: this.key }).catch(() => undefined);
+    }
   }
 
   /** Called by the client when Bridge forwards a report for this device. */
@@ -275,6 +283,7 @@ class BridgeClient {
 class BridgeHid implements HID {
   #client: BridgeClient;
   #poll: ReturnType<typeof setInterval> | null = null;
+  #listing: Promise<HIDDevice[]> | null = null;
   #listeners: Record<"connect" | "disconnect", Set<(event: HIDConnectionEvent) => void>> = {
     connect: new Set(),
     disconnect: new Set(),
@@ -300,6 +309,17 @@ class BridgeHid implements HID {
    * with no picker to click through.
    */
   async getDevices(): Promise<HIDDevice[]> {
+    if (this.#listing) return this.#listing;
+    const listing = this.#listDevices();
+    this.#listing = listing;
+    try {
+      return await listing;
+    } finally {
+      if (this.#listing === listing) this.#listing = null;
+    }
+  }
+
+  async #listDevices(): Promise<HIDDevice[]> {
     const reply = await this.#client.request({ type: "list", vendorIds: vendorIdsFor(SUPPORTED_HID_FILTERS) });
     const { devices, added, removed } = this.#client.reconcile(reply.devices ?? []);
     for (const device of added) this.#emit("connect", device);
